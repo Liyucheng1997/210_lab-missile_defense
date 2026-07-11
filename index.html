@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#060b12" />
+    <title>远程飞行与区域防御 · 教学沙盘</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark"><span></span><span></span><span></span></div>
+          <div>
+            <div class="eyebrow">STRATEGIC SYSTEMS LAB</div>
+            <h1>远程飞行与区域防御 <em>教学沙盘</em></h1>
+          </div>
+        </div>
+        <div class="status-row">
+          <span class="status-pill safe"><i></i> 非作战仿真</span>
+          <span class="clock" id="simClock">T+ 00:00</span>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="left-panel glass">
+          <div class="panel-title"><span>任务剖面</span><small>MISSION PROFILE</small></div>
+          <div class="phase-list" id="phaseList"></div>
+          <div class="divider"></div>
+          <div class="panel-title compact"><span>图层</span><small>LAYERS</small></div>
+          <div class="layer-controls">
+            <label><input type="checkbox" data-layer="trajectory" checked><span></span>飞行走廊</label>
+            <label><input type="checkbox" data-layer="uncertainty" checked><span></span>定位不确定性</label>
+            <label><input type="checkbox" data-layer="defense" checked><span></span>防御感知范围</label>
+            <label><input type="checkbox" data-layer="labels" checked><span></span>关键节点</label>
+          </div>
+          <div class="legend">
+            <div><i class="attack"></i>飞行器（虚构）</div>
+            <div><i class="defense"></i>防御系统（概念）</div>
+            <div><i class="sensor"></i>传感器观测</div>
+          </div>
+        </aside>
+
+        <section class="viewport">
+          <canvas id="globe"></canvas>
+          <div class="earth-label" id="launchLabel"><b>发射区 A</b><small>虚构坐标</small></div>
+          <div class="earth-label target" id="targetLabel"><b>目标区 B</b><small>虚构坐标</small></div>
+          <div class="earth-label defense" id="defenseLabel"><b>区域防御单元</b><small>末段拦截概念</small></div>
+          <div class="reticle" id="reticle"><span></span><span></span><b>TRACK</b></div>
+          <div class="view-hint">拖动旋转 · 滚轮缩放</div>
+          <div class="classification">EDUCATIONAL / NOT FOR OPERATIONAL USE</div>
+        </section>
+
+        <aside class="right-panel glass">
+          <div class="panel-title"><span>态势摘要</span><small>LIVE OVERVIEW</small></div>
+          <div class="metric-grid">
+            <div class="metric"><small>阶段</small><strong id="phaseMetric">待命</strong><span>PHASE</span></div>
+            <div class="metric"><small>归一化高度</small><strong id="altMetric">0.00</strong><span>SCALED</span></div>
+            <div class="metric"><small>跟踪质量</small><strong id="trackMetric">—</strong><span>CONCEPT</span></div>
+            <div class="metric"><small>防御窗口</small><strong id="windowMetric">关闭</strong><span>SIMULATED</span></div>
+          </div>
+
+          <div class="divider"></div>
+          <div class="panel-title compact"><span>导航状态</span><small>NAVIGATION</small></div>
+          <div class="nav-stack">
+            <div class="nav-row"><span>惯性参考</span><b id="insState">对准</b><i><u id="insBar"></u></i></div>
+            <div class="nav-row"><span>外部修正</span><b id="extState">不可用</b><i><u id="extBar"></u></i></div>
+            <div class="nav-row"><span>融合估计</span><b id="fusionState">稳定</b><i><u id="fusionBar"></u></i></div>
+          </div>
+          <div class="uncertainty-card">
+            <div class="mini-radar"><span></span><i></i><b id="errorDot"></b></div>
+            <div><small>估计不确定性</small><strong id="uncertaintyText">低</strong><p>示意值，不代表现实系统精度</p></div>
+          </div>
+
+          <div class="divider"></div>
+          <div class="panel-title compact"><span>防御链路</span><small>DEFENSE CHAIN</small></div>
+          <div class="defense-chain" id="defenseChain"></div>
+          <div class="notice"><b>边界说明</b><p>轨迹、坐标、性能和判据均为教学缩放或虚构；本项目不提供现实武器的设计、制导或瞄准能力。</p></div>
+        </aside>
+      </main>
+
+      <section class="bottom-deck glass">
+        <div class="transport">
+          <button id="resetBtn" title="重置">↺</button>
+          <button class="primary" id="playBtn" title="播放">▶</button>
+          <button id="stepBtn" title="下一阶段">▮▶</button>
+        </div>
+        <div class="timeline-wrap">
+          <div class="timeline-labels" id="timelineLabels"></div>
+          <input type="range" id="timeline" min="0" max="1000" value="0" />
+          <div class="event-line" id="eventLine"></div>
+        </div>
+        <div class="speed-control">
+          <small>速度</small>
+          <button data-speed="0.5">0.5×</button>
+          <button data-speed="1" class="active">1×</button>
+          <button data-speed="2">2×</button>
+        </div>
+      </section>
+
+      <section class="knowledge-drawer glass" id="knowledgeDrawer">
+        <button class="drawer-tab" id="drawerBtn"><span>原理与难点</span><i>⌃</i></button>
+        <div class="drawer-content">
+          <article><span>01</span><div><h3>导航不是“知道坐标”</h3><p>系统持续估计位置、速度、姿态及其不确定性。惯性测量能连续工作却会积累漂移；外部观测可校正误差，但可能间歇、延迟或受环境影响。</p></div></article>
+          <article><span>02</span><div><h3>控制是受约束的闭环</h3><p>制导层提出期望运动趋势，控制层根据状态估计驱动执行机构。结构载荷、热环境、执行器能力和测量噪声共同限定可实现的机动。</p></div></article>
+          <article><span>03</span><div><h3>防御首先是信息问题</h3><p>预警、探测、关联、跟踪与识别先于拦截。防御系统必须在有限时间内将多源观测合成为可信轨迹，并管理误报与资源冲突。</p></div></article>
+          <article><span>04</span><div><h3>拦截不是“追上目标”</h3><p>末段区域防御依赖预测交会与闭环修正。速度、观测延迟、目标不确定性和极短决策窗口，使系统工程与验证比单一算法更困难。</p></div></article>
+          <article><span>05</span><div><h3>任务成功是系统结果</h3><p>可靠性、通信、传感器覆盖、人员决策、规则约束与测试证据共同决定任务结果。任何单点高性能都不能替代端到端系统可信性。</p></div></article>
+        </div>
+      </section>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
