@@ -12,13 +12,14 @@
         <div class="brand">
           <div class="brand-mark"><span></span><span></span><span></span></div>
           <div>
-            <div class="eyebrow">STRATEGIC SYSTEMS LAB</div>
+            <div class="eyebrow">STRATEGIC SYSTEMS LAB · 3-DOF PHYSICS</div>
             <h1>远程飞行与区域防御 <em>教学沙盘</em></h1>
           </div>
         </div>
         <div class="status-row">
-          <span class="status-pill safe"><i></i> 非作战仿真</span>
-          <span class="clock" id="simClock">T+ 00:00</span>
+          <span class="status-pill safe"><i></i> 虚构试验场 · 非作战仿真</span>
+          <span class="phase-chip" id="phaseChip">发射准备</span>
+          <span class="clock" id="simClock">T− 00:15</span>
         </div>
       </header>
 
@@ -26,56 +27,86 @@
         <aside class="left-panel glass">
           <div class="panel-title"><span>任务剖面</span><small>MISSION PROFILE</small></div>
           <div class="phase-list" id="phaseList"></div>
+
+          <div class="divider"></div>
+          <div class="panel-title compact"><span>视角</span><small>CAMERA</small></div>
+          <div class="cam-grid" id="camModes">
+            <button data-cam="auto" class="active">自动导演</button>
+            <button data-cam="chase">跟踪</button>
+            <button data-cam="globe">全球</button>
+            <button data-cam="region">末段区域</button>
+          </div>
+          <select id="chaseTarget" class="select">
+            <option value="auto">跟踪对象：自动</option>
+            <option value="stack">主飞行体 / 再入体</option>
+            <option value="pbv">末助推舱</option>
+            <option value="s1">一级残骸</option>
+            <option value="s2">二级残骸</option>
+            <option value="s3">三级残骸</option>
+            <option value="interceptor">拦截弹</option>
+            <option value="ship">防御舰</option>
+            <option value="platform">发射平台</option>
+            <option value="sat">预警卫星</option>
+          </select>
+
           <div class="divider"></div>
           <div class="panel-title compact"><span>图层</span><small>LAYERS</small></div>
           <div class="layer-controls">
-            <label><input type="checkbox" data-layer="trajectory" checked><span></span>飞行走廊</label>
-            <label><input type="checkbox" data-layer="uncertainty" checked><span></span>定位不确定性</label>
-            <label><input type="checkbox" data-layer="defense" checked><span></span>防御感知范围</label>
-            <label><input type="checkbox" data-layer="labels" checked><span></span>关键节点</label>
+            <label><input type="checkbox" data-layer="trajectory" checked><span></span>弹道与星下点轨迹</label>
+            <label><input type="checkbox" data-layer="debris" checked><span></span>残骸落区</label>
+            <label><input type="checkbox" data-layer="sensors" checked><span></span>传感器覆盖 / 视线</label>
+            <label><input type="checkbox" data-layer="labels" checked><span></span>标注</label>
+            <label><input type="checkbox" data-layer="clouds" checked><span></span>云层</label>
           </div>
-          <div class="legend">
-            <div><i class="attack"></i>飞行器（虚构）</div>
-            <div><i class="defense"></i>防御系统（概念）</div>
-            <div><i class="sensor"></i>传感器观测</div>
-          </div>
+
+          <div class="divider"></div>
+          <div class="panel-title compact"><span>事件</span><small>EVENT LOG</small></div>
+          <div class="event-log" id="eventLog"></div>
         </aside>
 
         <section class="viewport">
           <canvas id="globe"></canvas>
-          <div class="earth-label" id="launchLabel"><b>发射区 A</b><small>虚构坐标</small></div>
-          <div class="earth-label target" id="targetLabel"><b>目标区 B</b><small>虚构坐标</small></div>
-          <div class="earth-label defense" id="defenseLabel"><b>区域防御单元</b><small>末段拦截概念</small></div>
-          <div class="reticle" id="reticle"><span></span><span></span><b>TRACK</b></div>
-          <div class="view-hint">拖动旋转 · 滚轮缩放</div>
-          <div class="classification">EDUCATIONAL / NOT FOR OPERATIONAL USE</div>
+          <div id="labels"></div>
+          <div class="hud" id="hud">
+            <div class="hud-obj" id="hudObj">主飞行体</div>
+            <div class="hud-row"><span>ALT</span><b id="hudAlt">0.0</b><i>km</i></div>
+            <div class="hud-row"><span>VEL</span><b id="hudVel">0.00</b><i>km/s</i></div>
+            <div class="hud-row"><span>Ma</span><b id="hudMach">0.0</b><i></i></div>
+          </div>
+          <div class="reticle" id="reticle"><span></span><b>TRACK</b></div>
+          <div class="toast" id="toast"></div>
+          <div class="loading" id="loading"><div><b>正在积分飞行方程…</b><small>RK4 · US76 大气 · J2 引力</small></div></div>
+          <div class="view-hint">拖动旋转 · 滚轮缩放 · 空格播放/暂停</div>
+          <div class="classification">FICTIONAL TEST RANGE / EDUCATIONAL ONLY</div>
         </section>
 
         <aside class="right-panel glass">
-          <div class="panel-title"><span>态势摘要</span><small>LIVE OVERVIEW</small></div>
+          <div class="panel-title"><span>遥测</span><small id="telemSrc">TELEMETRY · 主飞行体</small></div>
           <div class="metric-grid">
-            <div class="metric"><small>阶段</small><strong id="phaseMetric">待命</strong><span>PHASE</span></div>
-            <div class="metric"><small>归一化高度</small><strong id="altMetric">0.00</strong><span>SCALED</span></div>
-            <div class="metric"><small>跟踪质量</small><strong id="trackMetric">—</strong><span>CONCEPT</span></div>
-            <div class="metric"><small>防御窗口</small><strong id="windowMetric">关闭</strong><span>SIMULATED</span></div>
+            <div class="metric"><small>高度</small><strong id="mAlt">0.0</strong><span>KM</span></div>
+            <div class="metric"><small>惯性速度</small><strong id="mVel">0.00</strong><span>KM/S</span></div>
+            <div class="metric"><small>马赫数</small><strong id="mMach">0.0</strong><span>MACH</span></div>
+            <div class="metric"><small>动压</small><strong id="mQ">0.0</strong><span>KPA</span></div>
+            <div class="metric"><small>轴向过载</small><strong id="mG">0.0</strong><span>G</span></div>
+            <div class="metric"><small>质量</small><strong id="mMass">0.0</strong><span>T</span></div>
+            <div class="metric"><small>地面航程</small><strong id="mRange">0</strong><span>KM</span></div>
+            <div class="metric"><small>弹道倾角</small><strong id="mGamma">90.0</strong><span>DEG</span></div>
+            <div class="metric wide"><small>驻点热流（Sutton–Graves）</small><strong id="mHeat">0.0</strong><span>MW/M²</span><i class="bar"><u id="heatBar"></u></i></div>
           </div>
 
           <div class="divider"></div>
-          <div class="panel-title compact"><span>导航状态</span><small>NAVIGATION</small></div>
-          <div class="nav-stack">
-            <div class="nav-row"><span>惯性参考</span><b id="insState">对准</b><i><u id="insBar"></u></i></div>
-            <div class="nav-row"><span>外部修正</span><b id="extState">不可用</b><i><u id="extBar"></u></i></div>
-            <div class="nav-row"><span>融合估计</span><b id="fusionState">稳定</b><i><u id="fusionBar"></u></i></div>
-          </div>
-          <div class="uncertainty-card">
-            <div class="mini-radar"><span></span><i></i><b id="errorDot"></b></div>
-            <div><small>估计不确定性</small><strong id="uncertaintyText">低</strong><p>示意值，不代表现实系统精度</p></div>
-          </div>
+          <div class="panel-title compact"><span>高度–航程剖面</span><small>PROFILE</small></div>
+          <canvas id="profile" width="560" height="250"></canvas>
 
           <div class="divider"></div>
           <div class="panel-title compact"><span>防御链路</span><small>DEFENSE CHAIN</small></div>
           <div class="defense-chain" id="defenseChain"></div>
-          <div class="notice"><b>边界说明</b><p>轨迹、坐标、性能和判据均为教学缩放或虚构；本项目不提供现实武器的设计、制导或瞄准能力。</p></div>
+          <div class="sensor-readout">
+            <div><span>雷达—目标距离</span><b id="rRange">—</b></div>
+            <div><span>雷达仰角</span><b id="rEl">—</b></div>
+            <div><span>预计交会倒计时</span><b id="rTti">—</b></div>
+          </div>
+          <div class="notice"><b>建模说明</b><p>三自由度质点动力学（RK4）、US76 标准大气、含 J2 的引力场与地球自转；运载器参数为通用教学量级，落点由固定程序角自然形成，不含瞄准与制导解算。拦截弹为预定交会点的运动学演示。</p></div>
         </aside>
       </main>
 
@@ -83,29 +114,32 @@
         <div class="transport">
           <button id="resetBtn" title="重置">↺</button>
           <button class="primary" id="playBtn" title="播放">▶</button>
-          <button id="stepBtn" title="下一阶段">▮▶</button>
+          <button id="stepBtn" title="下一事件">▮▶</button>
         </div>
         <div class="timeline-wrap">
           <div class="timeline-labels" id="timelineLabels"></div>
-          <input type="range" id="timeline" min="0" max="1000" value="0" />
-          <div class="event-line" id="eventLine"></div>
+          <input type="range" id="timeline" min="0" max="10000" value="0" />
+          <div class="event-ticks" id="eventTicks"></div>
         </div>
         <div class="speed-control">
-          <small>速度</small>
-          <button data-speed="0.5">0.5×</button>
-          <button data-speed="1" class="active">1×</button>
-          <button data-speed="2">2×</button>
+          <small>时间倍率</small>
+          <button data-speed="auto" class="active">自动</button>
+          <button data-speed="1">1×</button>
+          <button data-speed="5">5×</button>
+          <button data-speed="20">20×</button>
+          <button data-speed="60">60×</button>
+          <b id="speedNow">1×</b>
         </div>
       </section>
 
       <section class="knowledge-drawer glass" id="knowledgeDrawer">
         <button class="drawer-tab" id="drawerBtn"><span>原理与难点</span><i>⌃</i></button>
         <div class="drawer-content">
-          <article><span>01</span><div><h3>导航不是“知道坐标”</h3><p>系统持续估计位置、速度、姿态及其不确定性。惯性测量能连续工作却会积累漂移；外部观测可校正误差，但可能间歇、延迟或受环境影响。</p></div></article>
-          <article><span>02</span><div><h3>控制是受约束的闭环</h3><p>制导层提出期望运动趋势，控制层根据状态估计驱动执行机构。结构载荷、热环境、执行器能力和测量噪声共同限定可实现的机动。</p></div></article>
-          <article><span>03</span><div><h3>防御首先是信息问题</h3><p>预警、探测、关联、跟踪与识别先于拦截。防御系统必须在有限时间内将多源观测合成为可信轨迹，并管理误报与资源冲突。</p></div></article>
-          <article><span>04</span><div><h3>拦截不是“追上目标”</h3><p>末段区域防御依赖预测交会与闭环修正。速度、观测延迟、目标不确定性和极短决策窗口，使系统工程与验证比单一算法更困难。</p></div></article>
-          <article><span>05</span><div><h3>任务成功是系统结果</h3><p>可靠性、通信、传感器覆盖、人员决策、规则约束与测试证据共同决定任务结果。任何单点高性能都不能替代端到端系统可信性。</p></div></article>
+          <article><span>01</span><div><h3>火箭方程与分级</h3><p>Δv = Isp·g₀·ln(m₀/m₁)。单级难以把结构质量带到所需速度，分级抛掉空壳使每一级都“轻装上阵”。图中每次分离后质量骤降、过载随推进剂消耗持续上升。</p></div></article>
+          <article><span>02</span><div><h3>重力转弯与损失</h3><p>起飞后短暂垂直上升，再以小角度转弯，随后保持零攻角让重力“压弯”弹道，以降低气动载荷。最大动压通常出现在约 10 km、跨/超声速附近；重力损失与阻力损失合计常达 1 km/s 以上。</p></div></article>
+          <article><span>03</span><div><h3>中段：开普勒椭圆</h3><p>关机后飞行体在真空中沿以地心为焦点的椭圆运动，地球自转让地面轨迹相对惯性弹道偏移。约 1 万公里航程的弹道顶点通常在一千公里以上，飞行时间约半小时。</p></div></article>
+          <article><span>04</span><div><h3>再入：热与过载</h3><p>以约 7 km/s 进入稠密大气，驻点热流 ∝ √ρ·v³，峰值热流与峰值减速都集中在几十公里高度的十余秒内；高温空气电离形成可见的等离子体鞘与尾迹。</p></div></article>
+          <article><span>05</span><div><h3>防御首先是几何与时间</h3><p>地基/舰载雷达受地球曲率限制，只能在目标越过视距后截获；从截获、建立航迹到决策、发射与交会只有数分钟。拦截弹必须提前飞向预测交会点，相对速度可达每秒数公里。</p></div></article>
         </div>
       </section>
     </div>

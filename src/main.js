@@ -1,102 +1,743 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import './style.css';
+import { buildScenario } from './sim/scenario.js';
+import { RE, OMEGA, P0, atmosphere } from './sim/environment.js';
+import { createEarth, createOceanPatch } from './scene/earth.js';
+import { buildLaunchVehicle, buildInterceptor, buildLaunchPlatform, buildShip, buildSatellite } from './scene/models.js';
+import { Plume, ParticleSystem, glowSprite, makeLine, DynamicLine, radarFan, surfaceRing, plumeLayer } from './scene/effects.js';
+import { toThree, exhaustSmoke, interceptorSmoke, reentryGlow, interceptDebris } from './scene/particles.js';
+import { LOGDEPTH_VERT_PARS, LOGDEPTH_VERT, LOGDEPTH_FRAG_PARS, LOGDEPTH_FRAG } from './scene/glsl.js';
+import { UI } from './ui.js';
 
-const phases = [
-  { name: '任务规划', en: 'PLAN', start: 0, end: .08 },
-  { name: '发射与助推', en: 'BOOST', start: .08, end: .25 },
-  { name: '中段飞行', en: 'MIDCOURSE', start: .25, end: .58 },
-  { name: '再入过渡', en: 'REENTRY', start: .58, end: .72 },
-  { name: '防御跟踪', en: 'TRACK', start: .72, end: .84 },
-  { name: '末段交会', en: 'INTERCEPT', start: .84, end: .96 },
-  { name: '任务评估', en: 'ASSESS', start: .96, end: 1.01 },
-];
-const chain = ['预警', '探测', '跟踪', '交战'];
-const state = { progress: 0, playing: false, speed: 1, last: performance.now(), layers: { trajectory:true, uncertainty:true, defense:true, labels:true } };
+const $ = s => document.querySelector(s);
+const KM = .001;                                 // 模型米 → km
+const v3 = () => new THREE.Vector3();
+const P = [0, 0, 0], A = [0, 0, 0];
 
-const phaseList = document.querySelector('#phaseList');
-phases.forEach((p,i)=> phaseList.insertAdjacentHTML('beforeend', `<div class="phase-item" data-phase="${i}"><span class="num">0${i+1}</span><b>${p.name}</b><small>${p.en}</small></div>`));
-document.querySelector('#defenseChain').innerHTML = chain.map((x,i)=>`<div class="chain-item" data-chain="${i}"><i></i><b>${x}</b></div>`).join('');
-document.querySelector('#timelineLabels').innerHTML = ['T+00','助推','中段','再入','交会','评估'].map(x=>`<span>${x}</span>`).join('');
-document.querySelector('#eventLine').innerHTML = '<i></i>'.repeat(18);
+setTimeout(init, 30);
 
-const canvas = document.querySelector('#globe');
-const scene = new THREE.Scene();
-scene.fog = new THREE.FogExp2(0x02060a, .018);
-const camera = new THREE.PerspectiveCamera(38, 1, .1, 100);
-camera.position.set(0.8, 1.7, 8.7);
-const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, alpha:true, powerPreference:'high-performance' });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-renderer.outputColorSpace = THREE.SRGBColorSpace;
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.42;
-const controls = new OrbitControls(camera, canvas);
-controls.enableDamping = true; controls.dampingFactor = .06; controls.minDistance = 5.2; controls.maxDistance = 13; controls.enablePan = false; controls.autoRotate = true; controls.autoRotateSpeed = .22;
+function init() {
+  const S = buildScenario();
+  const D = S.defense, ST = S.stats;
+  const tShroud = S.events.find(e => e.key === 'shroud').t;
 
-scene.add(new THREE.HemisphereLight(0xb8dcf2, 0x173049, 1.65));
-scene.add(new THREE.AmbientLight(0x85a9bf, 1.05));
-const sun = new THREE.DirectionalLight(0xfff5df, 4.15); sun.position.set(-5,3,7); scene.add(sun);
-const rim = new THREE.DirectionalLight(0x5aafff, 2.0); rim.position.set(5,-1,-5); scene.add(rim);
+  // ---------------------------------------------------------------------------
+  // 渲染器与后期
+  // ---------------------------------------------------------------------------
+  const canvas = $('#globe');
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, logarithmicDepthBuffer: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 1.75));
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.0;
+  const camera = new THREE.PerspectiveCamera(42, 1, .0004, 5e7);
+  camera.position.set(.06, .012, .05);
 
-const R = 2.42;
-const globe = new THREE.Group(); scene.add(globe);
-const loader = new THREE.TextureLoader();
-const earthMat = new THREE.MeshPhongMaterial({ color:0x9ab0bd, shininess:10 });
-loader.load('assets/earth_atmos_2048.jpg', t=>{ t.colorSpace=THREE.SRGBColorSpace; earthMat.map=t; earthMat.needsUpdate=true; });
-loader.load('assets/earth_normal_2048.jpg', t=>{ earthMat.normalMap=t; earthMat.normalScale.set(.55,.55); earthMat.needsUpdate=true; });
-loader.load('assets/earth_specular_2048.jpg', t=>{ earthMat.specularMap=t; earthMat.specular=new THREE.Color(0x39586b); earthMat.needsUpdate=true; });
-const earth = new THREE.Mesh(new THREE.SphereGeometry(R, 96, 64), earthMat); globe.add(earth);
-const atmosphere = new THREE.Mesh(new THREE.SphereGeometry(R*1.025, 96,64), new THREE.ShaderMaterial({ transparent:true, side:THREE.BackSide, blending:THREE.AdditiveBlending, uniforms:{ glowColor:{value:new THREE.Color(0x3eabdc)} }, vertexShader:`varying vec3 vNormal; void main(){vNormal=normalize(normalMatrix*normal);gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`, fragmentShader:`varying vec3 vNormal;uniform vec3 glowColor;void main(){float a=pow(.58-dot(vNormal,vec3(0.,0.,1.)),3.2);gl_FragColor=vec4(glowColor,a*.48);}` })); globe.add(atmosphere);
-const starGeo = new THREE.BufferGeometry(); const starPos=[]; for(let i=0;i<900;i++){const d=35+Math.random()*35, u=Math.random()*2-1,a=Math.random()*Math.PI*2,r=Math.sqrt(1-u*u);starPos.push(d*r*Math.cos(a),d*u,d*r*Math.sin(a));} starGeo.setAttribute('position',new THREE.Float32BufferAttribute(starPos,3));scene.add(new THREE.Points(starGeo,new THREE.PointsMaterial({color:0x7895a8,size:.045,transparent:true,opacity:.55,sizeAttenuation:true})));
+  const bgScene = new THREE.Scene(), fgScene = new THREE.Scene();
+  bgScene.background = new THREE.Color(0x000000);
+  const rt = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, samples: 4 });
+  const composer = new EffectComposer(renderer, rt);
+  composer.addPass(new RenderPass(bgScene, camera));
+  const fgPass = new RenderPass(fgScene, camera); fgPass.clear = false; fgPass.clearDepth = false;
+  composer.addPass(fgPass);
+  const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), .55, .55, .92);
+  composer.addPass(bloom);
+  composer.addPass(new OutputPass());
 
-function geo(lat, lon, radius=R){ const phi=(90-lat)*Math.PI/180, theta=(lon+180)*Math.PI/180; return new THREE.Vector3(-radius*Math.sin(phi)*Math.cos(theta),radius*Math.cos(phi),radius*Math.sin(phi)*Math.sin(theta)); }
-// Deliberately fictional endpoints: visual narrative, not a geographic targeting tool.
-const launchDir=geo(43,-32,1).normalize(), targetDir=geo(36,118,1).normalize(), defenseDir=geo(32,112,1).normalize();
-function slerpDir(a,b,t){const dot=THREE.MathUtils.clamp(a.dot(b),-1,1),theta=Math.acos(dot);if(theta<.001)return a.clone();return a.clone().multiplyScalar(Math.sin((1-t)*theta)/Math.sin(theta)).add(b.clone().multiplyScalar(Math.sin(t*theta)/Math.sin(theta))).normalize();}
-function flightPoint(t){const dir=slerpDir(launchDir,targetDir,t);const alt=Math.pow(Math.sin(Math.PI*t),.72)*2.15;return dir.multiplyScalar(R+alt);}
-function curvePoints(fn,n=240){return Array.from({length:n},(_,i)=>fn(i/(n-1)));}
-function line(points,color,opacity=1){return new THREE.Line(new THREE.BufferGeometry().setFromPoints(points),new THREE.LineBasicMaterial({color,transparent:true,opacity,blending:THREE.AdditiveBlending}));}
-const trajectoryGroup=new THREE.Group();scene.add(trajectoryGroup);
-const path=line(curvePoints(flightPoint),0xff765d,.55);trajectoryGroup.add(path);
-const pathGhost=line(curvePoints(t=>flightPoint(t).multiplyScalar(1.006)),0xffb067,.16);trajectoryGroup.add(pathGhost);
-const vehicle=new THREE.Mesh(new THREE.SphereGeometry(.055,18,12),new THREE.MeshBasicMaterial({color:0xffd0a0}));vehicle.add(new THREE.PointLight(0xff5b3d,2.5,1.2));scene.add(vehicle);
-const vehicleHalo=new THREE.Mesh(new THREE.SphereGeometry(.13,18,12),new THREE.MeshBasicMaterial({color:0xff5f43,transparent:true,opacity:.15,blending:THREE.AdditiveBlending,depthWrite:false}));vehicle.add(vehicleHalo);
+  const controls = new OrbitControls(camera, canvas);
+  controls.enableDamping = true; controls.dampingFactor = .08; controls.enablePan = false; controls.zoomSpeed = 1.2; controls.rotateSpeed = .6;
+  let lastUser = -1e9;
+  controls.addEventListener('start', () => { lastUser = performance.now(); });
+  controls.addEventListener('change', () => { if (performance.now() - lastUser < 200) lastUser = performance.now(); });
+  canvas.addEventListener('wheel', () => { lastUser = performance.now(); }, { passive: true });
 
-const uncertaintyGroup=new THREE.Group();scene.add(uncertaintyGroup);
-const uncertaintyRing=new THREE.Mesh(new THREE.RingGeometry(.11,.13,64),new THREE.MeshBasicMaterial({color:0xffb457,transparent:true,opacity:.65,side:THREE.DoubleSide,depthTest:false}));uncertaintyGroup.add(uncertaintyRing);
-const estimateDot=new THREE.Mesh(new THREE.SphereGeometry(.028,12,8),new THREE.MeshBasicMaterial({color:0xffc36c,depthTest:false}));uncertaintyGroup.add(estimateDot);
+  // 两个场景共享同一套“浮动原点 + 地固系”变换
+  const bgRoot = new THREE.Group(), fgRoot = new THREE.Group();
+  const bgEarth = new THREE.Group(), fgEarth = new THREE.Group();
+  bgScene.add(bgRoot); bgRoot.add(bgEarth); fgScene.add(fgRoot); fgRoot.add(fgEarth);
 
-const defenseGroup=new THREE.Group();scene.add(defenseGroup);
-function surfaceRing(dir,angularRadius,color){const basis1=new THREE.Vector3().crossVectors(dir,Math.abs(dir.y)<.9?new THREE.Vector3(0,1,0):new THREE.Vector3(1,0,0)).normalize(),basis2=new THREE.Vector3().crossVectors(dir,basis1).normalize();const pts=[];for(let i=0;i<=100;i++){const a=i/100*Math.PI*2;pts.push(dir.clone().multiplyScalar(Math.cos(angularRadius)).add(basis1.clone().multiplyScalar(Math.sin(angularRadius)*Math.cos(a))).add(basis2.clone().multiplyScalar(Math.sin(angularRadius)*Math.sin(a))).normalize().multiplyScalar(R*1.006));}return line(pts,color,.45)}
-[.13,.24,.36].forEach((a,i)=>defenseGroup.add(surfaceRing(defenseDir,a,i===2?0x58d6e7:0x418ea2)));
-const defenseSite=new THREE.Mesh(new THREE.ConeGeometry(.07,.22,6),new THREE.MeshBasicMaterial({color:0x63e4ee}));defenseSite.position.copy(defenseDir.clone().multiplyScalar(R+.1));defenseSite.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0),defenseDir);defenseGroup.add(defenseSite);
-const interceptT=.89, interceptPoint=flightPoint(interceptT);
-function interceptorPoint(t){const a=defenseDir.clone().multiplyScalar(R+.04), b=interceptPoint;const p=a.clone().lerp(b,t);p.add(a.clone().normalize().lerp(b.clone().normalize(),t).normalize().multiplyScalar(Math.sin(Math.PI*t)*.38));return p;}
-const interceptPath=line(curvePoints(interceptorPoint,100),0x58d6e7,.48);defenseGroup.add(interceptPath);
-const interceptor=new THREE.Mesh(new THREE.SphereGeometry(.042,14,10),new THREE.MeshBasicMaterial({color:0xa8fbff}));interceptor.add(new THREE.PointLight(0x58d6e7,2,1));defenseGroup.add(interceptor);interceptor.visible=false;
-const eventBurst=new THREE.Mesh(new THREE.SphereGeometry(.14,24,16),new THREE.MeshBasicMaterial({color:0xffd278,transparent:true,opacity:0,wireframe:true,blending:THREE.AdditiveBlending}));eventBurst.position.copy(interceptPoint);scene.add(eventBurst);
+  // ---------------------------------------------------------------------------
+  // 地球、海面、星空、太阳
+  // ---------------------------------------------------------------------------
+  const loader = new THREE.TextureLoader();
+  const earth = createEarth(loader);
+  bgEarth.add(earth.group);
+  const U = earth.uniforms;
+  const simUniforms = { uSimTime: { value: 0 }, uSun: U.uSun };
+  const site = toThree(S.main.pointAt(0)), siteUp = site.clone().normalize();
+  const siteSea = siteUp.clone().multiplyScalar(RE);
+  const ship = toThree(D.ship), shipUp = ship.clone().normalize();
+  earth.cloudUniforms.uClear.value[0].copy(siteSea); earth.cloudUniforms.uClear.value[1].copy(ship);
+  const oceanA = createOceanPatch(siteSea, U), oceanB = createOceanPatch(ship, U);
+  bgEarth.add(oceanA, oceanB);
 
-const labelEls=[['launchLabel',launchDir.clone().multiplyScalar(R*1.02)],['targetLabel',targetDir.clone().multiplyScalar(R*1.02)],['defenseLabel',defenseDir.clone().multiplyScalar(R*1.02)]];
-function positionLabel(el,p){const v=p.clone().project(camera);const rect=canvas.getBoundingClientRect();const visible=v.z<1&&p.clone().sub(camera.position).dot(p)>-R*R*.2;el.style.display=visible&&state.layers.labels?'block':'none';el.style.left=`${(v.x*.5+.5)*rect.width}px`;el.style.top=`${(-v.y*.5+.5)*rect.height}px`;}
+  const sky = new THREE.Group(); bgScene.add(sky);
+  const stars = makeStars(); sky.add(stars);
+  const sunSprite = glowSprite(new THREE.Color(1, .95, .85), { size: 260, worldSize: false, intensity: 40, core: .035 });
+  sunSprite.renderOrder = -19; sky.add(sunSprite);
 
-function phaseAt(p){return Math.max(0,phases.findIndex(x=>p>=x.start&&p<x.end));}
-function updateUI(){const p=state.progress, idx=phaseAt(p), phase=phases[idx];document.querySelector('#timeline').value=p*1000;document.querySelector('#simClock').textContent=`T+ ${String(Math.floor(p*24)).padStart(2,'0')}:${String(Math.floor((p*1440)%60)).padStart(2,'0')}`;document.querySelectorAll('.phase-item').forEach((el,i)=>{el.classList.toggle('active',i===idx);el.classList.toggle('done',i<idx);});document.querySelector('#phaseMetric').textContent=phase.name;const alt=Math.pow(Math.sin(Math.PI*Math.min(p,.999)),.72);document.querySelector('#altMetric').textContent=alt.toFixed(2);const quality=p<.25?'初始化':p<.58?'间歇':p<.75?'建立':p<.9?'稳定':'收敛';document.querySelector('#trackMetric').textContent=quality;document.querySelector('#windowMetric').textContent=p>.78&&p<.95?'开启':'关闭';
-  const drift=.18+.62*Math.sin(Math.PI*Math.min(p/.82,1));document.querySelector('#insState').textContent=p<.08?'对准':p<.7?'漂移增长':'修正';document.querySelector('#insBar').style.width=`${(1-drift*.55)*100}%`;document.querySelector('#extState').textContent=p<.3?'不可用':p<.7?'间歇':'可用';document.querySelector('#extBar').style.width=`${p<.3?12:p<.7?48:82}%`;document.querySelector('#fusionState').textContent=p<.22?'稳定':p<.65?'预测':'收敛';document.querySelector('#fusionBar').style.width=`${62+Math.sin(p*8)*12}%`;document.querySelector('#uncertaintyText').textContent=drift>.62?'较高':drift>.38?'中等':'低';const dot=document.querySelector('#errorDot');dot.style.left=`${25+Math.sin(p*18)*drift*14}px`;dot.style.top=`${25+Math.cos(p*13)*drift*14}px`;
-  let chainIndex=p<.57?-1:p<.7?0:p<.78?1:p<.86?2:3;document.querySelectorAll('.chain-item').forEach((el,i)=>{el.classList.toggle('active',i===chainIndex);el.classList.toggle('done',i<chainIndex)});
+  // ---------------------------------------------------------------------------
+  // 光照
+  // ---------------------------------------------------------------------------
+  const sunLight = new THREE.DirectionalLight(0xffffff, 3); fgScene.add(sunLight, sunLight.target);
+  const hemi = new THREE.HemisphereLight(0x8fb8ff, 0x0c2a44, .4); fgScene.add(hemi);
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  fgScene.environment = pmrem.fromScene(envScene(), .04).texture;
+
+  // ---------------------------------------------------------------------------
+  // 模型
+  // ---------------------------------------------------------------------------
+  const frameAt = (pos, fwdHint) => {
+    const up = pos.clone().normalize();
+    const f = fwdHint.clone().addScaledVector(up, -fwdHint.dot(up)).normalize();
+    const east = f.clone().cross(up).normalize();     // x = f × up（右）
+    return new THREE.Matrix4().makeBasis(east, up, f.clone().negate());
+  };
+  const placeOnSurface = (obj, pos, fwd) => { obj.position.copy(pos); obj.quaternion.setFromRotationMatrix(frameAt(pos, fwd)); };
+  const headThree = (() => {
+    const p1 = toThree(S.main.position(25));
+    return p1.sub(site).addScaledVector(siteUp, -p1.clone().sub(site).dot(siteUp)).normalize();
+  })();
+
+  const platform = buildLaunchPlatform(); platform.scale.setScalar(KM);
+  const platWrap = new THREE.Group(); platWrap.add(platform); placeOnSurface(platWrap, siteSea, headThree.clone().applyAxisAngle(siteUp, Math.PI / 2));
+  fgEarth.add(platWrap);
+
+  const shipModel = buildShip(); shipModel.scale.setScalar(KM);
+  const shipWrap = new THREE.Group(); shipWrap.add(shipModel);
+  const PIg = toThree(D.PI).normalize().multiplyScalar(RE);
+  // 船首朝向交会点地面投影（模型 +X 为船首 → 让 frame 的 -Z 前向对应 +X：绕 up 旋转）
+  placeOnSurface(shipWrap, ship, PIg.clone().sub(ship)); shipModel.rotation.y = Math.PI / 2;
+  fgEarth.add(shipWrap);
+
+  const satModel = buildSatellite(); satModel.scale.setScalar(KM);
+  const satWrap = new THREE.Group(); satWrap.add(satModel);
+  const satPos = toThree(S.sat.p); placeOnSurface(satWrap, satPos, new THREE.Vector3(0, 1, 0));
+  fgEarth.add(satWrap);
+
+  // 运载器
+  const lv = buildLaunchVehicle();
+  const stack = new THREE.Group(), stackScale = new THREE.Group();
+  stackScale.scale.setScalar(KM); stackScale.add(lv.root); stack.add(stackScale); fgEarth.add(stack);
+  const plume = new Plume(); lv.root.add(plume.group);
+  const thrustMax = [0, 1, 2].map(i => { let m = 1; for (let t = ST.tIgn[i]; t < ST.tBo[i]; t += .5) m = Math.max(m, S.main.get('thrust', t)); return m; });
+  const nozzleExit = [-.6, 7.55, 12.95], nozzleR = [.58, .5, .42];
+
+  // 分离体可视化
+  const spentObjs = S.spent.map(tr => {
+    const key = tr.key.startsWith('shroud') ? (tr.key === 'shroud0' ? 'shroudL' : 'shroudR') : tr.key;
+    const wrap = new THREE.Group(), holder = new THREE.Group(); holder.scale.setScalar(KM);
+    const clone = lv.parts[key].clone(); clone.position.y = -lv.centers[key];
+    holder.add(clone); wrap.add(holder); fgEarth.add(wrap); wrap.visible = false;
+    const r = mulberry(tr.t0 * 1000 | 0);
+    return { tr, wrap, holder, key, center: lv.centers[key], spin: new THREE.Vector3(r() - .5, (r() - .5) * .3, r() - .5).normalize(), rate: (key.startsWith('shroud') ? .9 : .12 + r() * .25) * (r() > .5 ? 1 : -1), side: key === 'shroudL' ? 1 : -1 };
+  });
+  const mkPart = (part, center) => {
+    const wrap = new THREE.Group(), holder = new THREE.Group(); holder.scale.setScalar(KM);
+    const c = part.clone(); c.position.y = -center; holder.add(c); wrap.add(holder); fgEarth.add(wrap); wrap.visible = false;
+    return { wrap, holder, clone: c };
+  };
+  const pbvObj = mkPart(lv.parts.pbv, 16.6);
+  const pbvPlume = new Plume(); pbvPlume.group.position.y = 16.3; lv.root.add(pbvPlume.group);
+  const rvObj = mkPart(lv.parts.rv, 0); rvObj.clone.position.y = -.9;
+  // 再入等离子体：鞘层 + 尾流
+  const sheath = makeSheath(); sheath.position.y = -.9; rvObj.holder.add(sheath);
+  const wake = plumeLayer([2.6, 1.5, .9], [1.4, .35, .25], 9); wake.position.y = -.9; rvObj.holder.add(wake);
+  const wake2 = plumeLayer([1.3, .55, .9], [.5, .15, .5], 11); wake2.position.y = -.9; rvObj.holder.add(wake2);
+  const rvLight = new THREE.PointLight(0xffb070, 0, .3, 2); rvObj.holder.add(rvLight);
+
+  // 拦截弹
+  const it = buildInterceptor();
+  const itWrap = new THREE.Group(), itHolder = new THREE.Group(); itHolder.scale.setScalar(KM); itHolder.add(it.root); itWrap.add(itHolder); fgEarth.add(itWrap);
+  const itPlume = new Plume(); it.root.add(itPlume.group);
+  const kvPuffs = new THREE.Group(); it.parts.kv.add(kvPuffs);
+  for (let i = 0; i < 4; i++) { const p = plumeLayer([3, 3, 3.2], [1, 1, 1.4], 20 + i); p.position.set(Math.cos(i * Math.PI / 2) * .18, 5.2, Math.sin(i * Math.PI / 2) * .18); p.rotation.z = Math.PI / 2; p.rotation.y = -i * Math.PI / 2; p.userData.i = i; kvPuffs.add(p); }
+  const droppedObjs = D.dropped.map((tr, i) => {
+    const part = i === 0 ? it.parts.booster : it.parts.stage2;
+    const o = mkPart(part, i === 0 ? 1.5 : 4.0);
+    if (i === 1) { const n = it.parts.nose.clone(); n.position.y = -4.0; o.holder.add(n); }
+    return { tr, ...o, rate: .8 + i * .5 };
+  });
+
+  // 碎片
+  const debrisMesh = new THREE.InstancedMesh(new THREE.DodecahedronGeometry(.0012, 0), new THREE.MeshStandardMaterial({ color: 0x3a332d, roughness: .7, metalness: .4, emissive: 0xff5a1a, emissiveIntensity: 0 }), D.debris.length);
+  debrisMesh.frustumCulled = false; fgEarth.add(debrisMesh);
+
+  // ---------------------------------------------------------------------------
+  // 粒子
+  // ---------------------------------------------------------------------------
+  const smokeA = new ParticleSystem(exhaustSmoke(S, site, nozzleExit.map(x => x - .3)), site, { uniforms: simUniforms });
+  const smokeB = new ParticleSystem(interceptorSmoke(D.interceptor, ship), ship, { uniforms: simUniforms });
+  const glowRV = new ParticleSystem(reentryGlow(S.rv, ST.reentry.t - 30, D.tI, toThree(D.PI)), toThree(D.PI), { additive: true, uniforms: simUniforms });
+  const glowDebris = new ParticleSystem(interceptDebris(S, toThree(D.PI)), toThree(D.PI), { additive: true, uniforms: simUniforms });
+  fgEarth.add(smokeA.mesh, smokeB.mesh, glowRV.mesh, glowDebris.mesh);
+  const flash = glowSprite(new THREE.Color(1, .93, .8), { size: 1, intensity: 0, core: .12 });
+  const fireball = glowSprite(new THREE.Color(1, .5, .18), { size: 1, intensity: 0, core: .35 });
+  flash.position.copy(toThree(D.PI)); fireball.position.copy(toThree(D.PI));
+  fgEarth.add(flash, fireball);
+  const flashLight = new THREE.PointLight(0xffd0a0, 0, 40, 2); flashLight.position.copy(toThree(D.PI)); fgEarth.add(flashLight);
+
+  // ---------------------------------------------------------------------------
+  // 轨迹线 / 传感器
+  // ---------------------------------------------------------------------------
+  const lineMats = [];
+  const L = (pts, anchor, o) => { const l = makeLine(pts, anchor, o); lineMats.push(l.material); return l; };
+  const sampleTrack = (tr, t0, t1, dt, lift = 0) => { const ts = [], pts = []; for (let t = t0; t <= t1 + 1e-6; t += dt) { ts.push(t); const p = toThree(tr.position(Math.min(t, t1), P)); if (lift) p.setLength(RE + lift); pts.push(p); } return { ts, pts }; };
+  const mainS = sampleTrack(S.main, 0, ST.tRelease, .5), rvS = sampleTrack(S.rv, ST.tRelease, S.rv.t1, 1);
+  const trajTs = [...mainS.ts, ...rvS.ts], trajPts = [...mainS.pts, ...rvS.pts];
+  const layers = { trajectory: new THREE.Group(), debris: new THREE.Group(), sensors: new THREE.Group() };
+  Object.values(layers).forEach(g => fgEarth.add(g));
+  const trajFull = L(trajPts, site, { color: 0xffc06a, width: 1.5, opacity: .55, dashed: true, dashSize: 60, gapSize: 40 });
+  const trajDone = L(trajPts, site, { color: 0xff6b4a, width: 2.6, opacity: .95 });
+  const groundPts = trajPts.map(p => p.clone().setLength(RE + .5));
+  const ground = L(groundPts, site, { color: 0xd8e6ee, width: 1, opacity: .35, dashed: true, dashSize: 25, gapSize: 25 });
+  layers.trajectory.add(trajFull, trajDone, ground);
+  const impactP = toThree(ST.impact.p);
+  for (const [r, o] of [[8, .9], [22, .5], [45, .25]]) layers.trajectory.add(surfaceRing(impactP, r, .4, { color: 0xffc06a, width: 1.4, opacity: o }));
+  const spentLines = S.spent.filter(s => !s.small).map(tr => { const s = sampleTrack(tr, tr.t0, tr.t1, 2); const l = L(s.pts, s.pts[0], { color: 0x9fb2bd, width: 1.2, opacity: .55 }); layers.debris.add(l); return { tr, ts: s.ts, l }; });
+  const impactMarks = S.spent.filter(s => !s.small).map(tr => { const p = toThree(tr.pointAt(tr.t.length - 1)); const ring = surfaceRing(p, 6, .3, { color: 0x9fb2bd, width: 1.2, opacity: .7 }); layers.debris.add(ring); return { tr, ring, p }; });
+  const itS = sampleTrack(D.interceptor, D.interceptor.t0, D.tI, .1);
+  const itLine = L(itS.pts, ship, { color: 0x6ee8f3, width: 2.4, opacity: .95 }); layers.trajectory.add(itLine);
+  const PIthree = toThree(D.PI);
+  const radarDir = PIthree.clone().sub(ship); // 指向威胁来向（上游）
+  const upstream = toThree(S.rv.position(D.tAcq)).sub(ship);
+  const fan = radarFan(toThree(D.radar), shipUp, upstream.addScaledVector(shipUp, -upstream.dot(shipUp)).normalize(), D.radarRange, { azHalf: 60, elMax: 80 });
+  layers.sensors.add(fan); void radarDir;
+  const beam = new DynamicLine(ship, { color: 0x6ee8f3, width: 1.6, opacity: .9, dashed: true, dashSize: 8, gapSize: 6 }); lineMats.push(beam.line.material); layers.sensors.add(beam.line);
+  const los = new DynamicLine(satPos, { color: 0xc9a5ff, width: 1.4, opacity: .8, dashed: true, dashSize: 400, gapSize: 300 }); lineMats.push(los.line.material); layers.sensors.add(los.line);
+  layers.sensors.add(surfaceRing(ship, 30, .3, { color: 0x6ee8f3, width: 1, opacity: .5 }));
+
+  // 远景标记点
+  const markers = makeMarkers(8); fgEarth.add(markers.points);
+
+  // ---------------------------------------------------------------------------
+  // 标注
+  // ---------------------------------------------------------------------------
+  const labelDefs = [
+    { id: 'site', cls: 'off', title: '海上发射平台 A', sub: `${S.sc.launch.lat.toFixed(1)}°N ${S.sc.launch.lon.toFixed(1)}°E · 虚构`, pos: () => site },
+    { id: 'impact', cls: 'tgt', title: '预计落区 B', sub: `开阔海域 · 航程 ${ST.impact.range.toFixed(0)} km`, pos: () => impactP },
+    { id: 'ship', cls: 'def', title: '区域防御单元（舰载）', sub: '雷达 + 垂直发射拦截弹', pos: () => ship },
+    { id: 'sat', cls: 'sat', title: '预警卫星', sub: 'GEO · 红外凝视', pos: () => satPos },
+    { id: 'vehicle', cls: 'off', title: '主飞行体', sub: '', pos: null },
+    { id: 'itc', cls: 'def', title: '拦截弹', sub: '', pos: null },
+    ...S.spent.filter(s => !s.small).map(tr => ({ id: 'fall' + tr.key, cls: 'dim', title: `${tr.name.replace('残骸', '')}落区`, sub: `T+${Math.round(tr.t1)} s 落海`, pos: () => toThree(tr.pointAt(tr.t.length - 1)), layer: 'debris', after: tr.t0 })),
+  ];
+  const labelBox = $('#labels');
+  for (const l of labelDefs) { l.el = document.createElement('div'); l.el.className = `lbl ${l.cls}`; l.el.innerHTML = `<b>${l.title}</b><small>${l.sub}</small>`; labelBox.appendChild(l.el); l.small = l.el.querySelector('small'); l.b = l.el.querySelector('b'); }
+
+  // ---------------------------------------------------------------------------
+  // 状态
+  // ---------------------------------------------------------------------------
+  const state = { t: S.t0, playing: false, speedMode: 'auto', speed: 1, speedNow: 1, layers: { trajectory: true, debris: true, sensors: true, labels: true, clouds: true }, cam: 'auto', chase: 'auto' };
+  const ui = new UI(S, { seek, toast });
+  const autoSpeed = t => t < -4 ? 2 : t < 18 ? 1 : t < 65 ? 2 : t < 186 ? 3 : t < 325 ? 10 : t < 362 ? 3 : t < D.tAcq - 60 ? 60 : t < D.tL - 8 ? 15 : t < D.tL + 10 ? 1.5 : t < D.tI - 2.5 ? 1 : t < D.tI + 1.2 ? .2 : t < D.tI + 15 ? 1 : 5;
+
+  // ---------------------------------------------------------------------------
+  // 相机：浮动原点 + 跟随局部坐标系 + 导演
+  // ---------------------------------------------------------------------------
+  const earthQ = new THREE.Quaternion(), Y = new THREE.Vector3(0, 1, 0);
+  const toI = p => p.clone().applyQuaternion(earthQ);          // 地固 → 惯性世界
+  const objState = (key, t) => {
+    // 返回 {p (地固 three), fwd, name, h, v, mach, center 偏移}
+    const tc = Math.max(t, 0);
+    const res = (tr, off, name, tt = tc) => {
+      const p = toThree(tr.position(tt, P)), ax = toThree(tr.axis(tt, A)), v = toThree(tr.velocity(tt, A));
+      p.addScaledVector(ax, off * KM);
+      return { p, fwd: v.lengthSq() > 1e-8 ? v : headThree.clone(), name, h: p.length() - RE, v: v.length(), mach: tr.mach ? tr.get('mach', tt) : null };
+    };
+    switch (key) {
+      case 'stack':
+        if (t < ST.tRelease) return res(S.main, t < ST.tBo[0] ? 9.5 : t < ST.tBo[1] ? 14 : 16.8, '主飞行体');
+        if (t < D.tI) return res(S.rv, .9, '再入体');
+        return { p: PIthree.clone(), fwd: toThree(S.rv.velocity(D.tI)), name: '交会点 · 碎片云', h: PIthree.length() - RE, v: 0, mach: null };
+      case 'pbv': return t < ST.tRelease ? objState('stack', t) : res(S.pbv, 16.6, '末助推舱', Math.min(tc, S.pbv.t1));
+      case 's1': case 's2': case 's3': {
+        const o = spentObjs.find(s => s.key === key);
+        return t < o.tr.t0 ? objState('stack', t) : res(o.tr, o.center, o.tr.name, Math.min(tc, o.tr.t1));
+      }
+      case 'interceptor':
+        if (t < D.tL) return { p: ship.clone().addScaledVector(shipUp, .012), fwd: PIg.clone().sub(ship), name: '拦截弹（待发）', h: .012, v: 0, mach: null };
+        if (t < D.tI) return res(D.interceptor, t < D.tKV ? 3 : 5.4, t < D.tKV ? '拦截弹' : '动能杀伤器');
+        return objState('stack', t);
+      case 'ship': return { p: ship.clone().addScaledVector(shipUp, .015), fwd: PIg.clone().sub(ship), name: '防御舰', h: 0, v: 0, mach: null };
+      case 'platform': return { p: site.clone().addScaledVector(siteUp, .006), fwd: headThree.clone(), name: '海上发射平台', h: .012, v: 0, mach: null };
+      case 'sat': return { p: satPos.clone(), fwd: new THREE.Vector3(1, 0, 0), name: '预警卫星', h: satPos.length() - RE, v: 3.07, mach: null };
+    }
+  };
+  const baseDist = { stack: .07, pbv: .022, s1: .04, s2: .03, s3: .025, interceptor: .03, ship: .5, platform: .3, sat: .05 };
+
+  function viewSpec(view, obj, t) {
+    if (view === 'chase') {
+      const o = objState(obj, t);
+      const pI = toI(o.p), fI = toI(o.fwd);
+      const m = frameAt(pI, fI.lengthSq() > 1e-10 ? fI.addScaledVector(toI(headThree), 1e-3) : toI(headThree));
+      return { F: pI, Q: new THREE.Quaternion().setFromRotationMatrix(m), min: .004, max: 4000, o };
+    }
+    if (view === 'globe') {
+      const mid = toI(toThree(S.rv.position(ST.apogee.t)));
+      const m = frameAt(mid.clone().normalize(), Y.clone().addScaledVector(mid.clone().normalize(), 0));
+      // 以弹道中点为“朝向相机”方向，北向上
+      const back = mid.clone().normalize(), up = Y.clone().addScaledVector(back, -Y.dot(back)).normalize(), right = up.clone().cross(back);
+      m.makeBasis(right, up, back);
+      return { F: new THREE.Vector3(), Q: new THREE.Quaternion().setFromRotationMatrix(m), min: RE * 1.08, max: 3e5 };
+    }
+    if (view === 'region' || view === 'debris') {
+      const g = view === 'debris' ? toI(PIthree) : toI(PIg.clone().setLength(RE + 40));
+      const along = toI(toThree(S.rv.velocity(D.tI)));
+      const m = frameAt(g, along.clone().cross(g.clone().normalize()));
+      return { F: g, Q: new THREE.Quaternion().setFromRotationMatrix(m), min: 1, max: 3e4 };
+    }
+  }
+  function director(t) {
+    if (t < 18) return ['chase', 'stack', .09];
+    if (t < 64) return ['chase', 'stack', .2];
+    if (t < 188) return ['chase', 'stack', .32];
+    if (t < 366) return ['chase', 'pbv', .026];
+    if (t < D.tAcq - 70) return ['globe', null, 30000];
+    if (t < D.tL - 5) return ['region', null, 3400];
+    if (t < D.tL + 12) return ['chase', 'interceptor', .06];
+    if (t < D.tI + .6) return ['chase', 'stack', .035];
+    return ['debris', null, 160];
+  }
+  const rig = { cur: null, prev: null, k: 1, d0: 1, d1: 1, hop: 0 };
+  function setView(view, obj, dist) {
+    const key = view + ':' + (obj || '');
+    if (rig.cur && rig.cur.key === key) return;
+    rig.prev = rig.cur; rig.cur = { view, obj, key, dist };
+    rig.k = rig.prev ? 0 : 1;
+    rig.d0 = camera.position.length(); rig.d1 = dist;
+    if (rig.prev) {
+      const a = viewSpec(rig.prev.view, rig.prev.obj, state.t).F, b = viewSpec(view, obj, state.t).F;
+      rig.hop = Math.max(0, Math.log(a.distanceTo(b) / Math.max(rig.d0, rig.d1, 1e-3)) * .85);
+    }
+    if (!rig.prev) camera.position.setLength(dist);
+  }
+  const smooth = x => x * x * (3 - 2 * x);
+  function updateRig(dtReal, t) {
+    if (state.cam === 'auto') { const [v, o, d] = director(t); setView(v, o, d); }
+    const cur = viewSpec(rig.cur.view, rig.cur.obj, t);
+    let F = cur.F, Q = cur.Q;
+    if (rig.k < 1) {
+      rig.k = Math.min(1, rig.k + dtReal / 2.6);
+      const e = smooth(rig.k), prev = viewSpec(rig.prev.view, rig.prev.obj, t);
+      const ld = Math.log(rig.d0) + (Math.log(rig.d1) - Math.log(rig.d0)) * e + rig.hop * Math.sin(Math.PI * e);
+      const d = Math.exp(ld);
+      const w = rig.hop > 0 ? e : Math.abs(rig.d1 - rig.d0) > 1e-9 ? THREE.MathUtils.clamp((d - rig.d0) / (rig.d1 - rig.d0), 0, 1) : e;
+      F = prev.F.clone().lerp(cur.F, w); Q = prev.Q.clone().slerp(cur.Q, e);
+      camera.position.setLength(d);
+      controls.minDistance = 0; controls.maxDistance = Infinity;
+    } else {
+      controls.minDistance = cur.min; controls.maxDistance = cur.max;
+      // 导演模式下用户未操作时，距离缓动到推荐值
+      if (state.cam === 'auto' && performance.now() - lastUser > 5000) {
+        const d = camera.position.length(), target = rig.cur.dist;
+        camera.position.setLength(Math.exp(Math.log(d) + (Math.log(target) - Math.log(d)) * Math.min(1, dtReal * .6)));
+      }
+    }
+    const inv = Q.clone().invert();
+    for (const root of [fgRoot, bgRoot]) { root.quaternion.copy(inv); root.position.copy(F).applyQuaternion(inv).negate(); }
+    return cur;
+  }
+
+  // ---------------------------------------------------------------------------
+  // 每帧更新
+  // ---------------------------------------------------------------------------
+  const tmpQ = new THREE.Quaternion(), tmpM = new THREE.Matrix4();
+  function orientAxis(obj, axisThree, posThree) {
+    const up = posThree.clone().normalize();
+    let x = axisThree.clone().cross(up);
+    if (x.lengthSq() < .0025) x = headThree.clone().cross(axisThree);
+    x.normalize();
+    const z = x.clone().cross(axisThree).normalize();
+    obj.quaternion.setFromRotationMatrix(tmpM.makeBasis(x, axisThree, z));
+  }
+  const prRatio = h => Math.min(1, atmosphere(h).p / P0);
+
+  function updateWorld(t, wall) {
+    const tc = Math.max(0, t);
+    earthQ.setFromAxisAngle(Y, OMEGA * t);
+    fgEarth.quaternion.copy(earthQ); bgEarth.quaternion.copy(earthQ);
+    simUniforms.uSimTime.value = t;
+    U.uTime.value = wall;
+
+    // --- 主飞行体 ---
+    const preRelease = t < ST.tRelease;
+    stack.visible = preRelease;
+    if (preRelease) {
+      const p = toThree(S.main.position(tc, P)), ax = toThree(S.main.axis(tc, A)).normalize();
+      stack.position.copy(p); orientAxis(stack, ax, p);
+      lv.parts.s1.visible = t < ST.tBo[0]; lv.parts.s2.visible = t < ST.tBo[1]; lv.parts.s3.visible = t < ST.tBo[2];
+      lv.parts.shroudL.visible = lv.parts.shroudR.visible = t < tShroud;
+      const thrust = t >= 0 ? S.main.get('thrust', tc) : 0, stg = t < ST.tBo[0] ? 0 : t < ST.tBo[1] ? 1 : 2;
+      const h = p.length() - RE, pr = prRatio(h);
+      const mainBurn = t >= 0 && t < ST.tBo[2] + .5 && thrust > 2000 && !(t > ST.tBo[stg] - .02 && t < ST.tIgn[Math.min(2, stg + 1)]);
+      plume.group.position.y = nozzleExit[stg];
+      plume.update(pr, mainBurn ? Math.min(1, thrust / thrustMax[stg]) : 0, nozzleR[stg], wall);
+      lv.nozzleInner.emissiveIntensity = mainBurn ? 3 : 0;
+      const pbvBurn = !mainBurn && thrust > 100;
+      pbvPlume.update(0, pbvBurn ? .6 : 0, .05, wall, 'small');
+    }
+    // --- 分离体 ---
+    for (const o of spentObjs) {
+      const vis = t >= o.tr.t0 && t < o.tr.t1;
+      o.wrap.visible = vis;
+      if (!vis) continue;
+      const age = t - o.tr.t0;
+      const p = toThree(o.tr.position(t, P));
+      const ax0 = toThree(o.tr.axis(o.tr.t0, A)).normalize();
+      // 以分离瞬间的姿态为基准，叠加翻滚
+      orientAxis(o.wrap, ax0, toThree(o.tr.pointAt(0)));
+      p.addScaledVector(ax0, o.center * KM);
+      o.wrap.position.copy(p);
+      if (o.key.startsWith('shroud')) {
+        o.holder.quaternion.setFromAxisAngle(new THREE.Vector3(0, 0, 1), o.side * Math.min(1.35, age * age * 1.4 + age * .3));
+        o.holder.quaternion.multiply(tmpQ.setFromAxisAngle(o.spin, age * o.rate * .4));
+      } else o.holder.quaternion.setFromAxisAngle(o.spin, age * o.rate);
+    }
+    // --- 末助推舱 / 再入体 ---
+    pbvObj.wrap.visible = !preRelease && t < S.pbv.t1;
+    if (pbvObj.wrap.visible) {
+      const p = toThree(S.pbv.position(t, P)), ax = toThree(S.main.axis(ST.tRelease - .01, A)).normalize();
+      orientAxis(pbvObj.wrap, ax, p); pbvObj.wrap.position.copy(p.addScaledVector(ax, 16.6 * KM));
+      pbvObj.holder.quaternion.setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.min(1, (t - ST.tRelease) * .02) * .6);
+    }
+    const rvVis = !preRelease && t < D.tI;
+    rvObj.wrap.visible = rvVis;
+    let heat = 0;
+    if (rvVis) {
+      const p = toThree(S.rv.position(t, P)), ax = toThree(S.rv.axis(t, A)).normalize();
+      orientAxis(rvObj.wrap, ax, p); rvObj.wrap.position.copy(p.addScaledVector(ax, 18.0 * KM));
+      rvObj.holder.quaternion.setFromAxisAngle(Y, (t - ST.tRelease) * 2.1);   // 自旋稳定
+      heat = S.rv.get('heat', t);
+    }
+    const hk = Math.min(1, heat / 18);
+    sheath.visible = wake.visible = wake2.visible = heat > .02;
+    sheath.material.uniforms.uI.value = hk * 3.2 + Math.min(1, heat * 2) * .3;
+    sheath.material.uniforms.uTime.value = wall;
+    for (const [w, L0, R1, I] of [[wake, 4 + 70 * hk, .9 + 5 * hk, 1.8], [wake2, 12 + 220 * hk, 1.5 + 14 * hk, .5]]) {
+      const u = w.material.uniforms; u.uLen.value = L0; u.uR0.value = .27; u.uR1.value = R1; u.uShape.value = .6; u.uIntensity.value = I * Math.min(1, heat * .8 + hk); u.uFalloff.value = 2.6; u.uEdge.value = 1.4; u.uTime.value = wall;
+    }
+    rvLight.intensity = .0006 * hk;
+
+    // --- 拦截弹 ---
+    const itVis = t >= D.tL - 30 && t < D.tI;
+    itWrap.visible = itVis;
+    if (itVis) {
+      const tt = Math.max(t, D.tL);
+      const p = toThree(D.interceptor.position(tt, P)), ax = toThree(D.interceptor.axis(tt, A)).normalize();
+      if (t < D.tL) { p.copy(ship).addScaledVector(shipUp, .0085); ax.copy(shipUp); }
+      orientAxis(itWrap, ax, p); itWrap.position.copy(p);
+      it.parts.booster.visible = t < D.tL + 4.8; it.parts.stage2.visible = it.parts.nose.visible = t < D.tKV;
+      const burn = t >= D.tL && D.interceptor.get('thrust', tt) > .5;
+      const st = t < D.tL + 4.8 ? 0 : 1;
+      itPlume.group.position.y = st === 0 ? -.28 : 3.08;
+      itPlume.update(prRatio(p.length() - RE), burn ? 1 : 0, st === 0 ? .17 : .12, wall);
+      kvPuffs.visible = t > D.tKV && t < D.tI;
+      kvPuffs.children.forEach(c => { const on = Math.sin(wall * 9 + c.userData.i * 2.3) > .55; const u = c.material.uniforms; c.visible = on; u.uLen.value = .7; u.uR0.value = .02; u.uR1.value = .12; u.uShape.value = .6; u.uIntensity.value = 1.2; u.uFalloff.value = 3; u.uEdge.value = 1.2; u.uTime.value = wall; });
+    }
+    for (const o of droppedObjs) {
+      const vis = t >= o.tr.t0 && t < Math.min(o.tr.t1, o.tr.t0 + 400);
+      o.wrap.visible = vis; if (!vis) continue;
+      const p = toThree(o.tr.position(t, P)), ax0 = toThree(o.tr.axis(o.tr.t0, A)).normalize();
+      orientAxis(o.wrap, ax0, p); o.wrap.position.copy(p);
+      o.holder.quaternion.setFromAxisAngle(new THREE.Vector3(1, 0, .3).normalize(), (t - o.tr.t0) * o.rate);
+    }
+    // --- 碎片 ---
+    debrisMesh.visible = t >= D.tI;
+    if (debrisMesh.visible) {
+      D.debris.forEach((d, i) => {
+        const tt = Math.min(t, d.t1), p = toThree(d.position(tt, P));
+        tmpQ.setFromAxisAngle(new THREE.Vector3(Math.sin(i), 1, Math.cos(i * 3)).normalize(), (t - D.tI) * (3 + i % 5));
+        tmpM.compose(p, tmpQ, new THREE.Vector3(1, 1, 1).multiplyScalar(.6 + (i % 7) * .4));
+        debrisMesh.setMatrixAt(i, tmpM);
+      });
+      debrisMesh.instanceMatrix.needsUpdate = true;
+      debrisMesh.material.emissiveIntensity = 4 * Math.max(0, 1 - (t - D.tI) / 25);
+    }
+    // --- 交会闪光 ---
+    const ft = t - D.tI;
+    const fOn = ft >= 0 && ft < 12;
+    flash.visible = fireball.visible = fOn;
+    if (fOn) {
+      flash.material.uniforms.uSize.value = .25 + 2.2 * Math.min(1, ft / .25);
+      flash.material.uniforms.uIntensity.value = 60 * Math.exp(-ft * 4);
+      fireball.material.uniforms.uSize.value = .1 + 1.3 * Math.sqrt(Math.min(ft, 6));
+      fireball.material.uniforms.uIntensity.value = 5 * Math.exp(-ft * .7);
+    }
+    flashLight.intensity = fOn ? 300 * Math.exp(-ft * 3) : 0;
+    oceanB.material.uniforms.uFlash.value.set(...toThree(D.PI).sub(ship).toArray(), 0);
+
+    // --- 线与传感器 ---
+    const idx = Math.max(0, binIdx(trajTs, Math.min(Math.max(t, 0), D.tI)));
+    trajDone.geometry.instanceCount = idx;
+    trajDone.visible = t > 0;
+    for (const s of spentLines) { s.l.visible = t > s.tr.t0; s.l.geometry.instanceCount = Math.max(0, binIdx(s.ts, t)); }
+    for (const m of impactMarks) m.ring.visible = t > m.tr.t0;
+    itLine.visible = t > D.tL; itLine.geometry.instanceCount = Math.max(0, Math.min(itS.ts.length - 1, Math.round((t - D.tL) / .1)));
+    fan.material.uniforms.uTime.value = wall; fan.material.uniforms.uOpacity.value = t > D.tAcq - 120 ? 1 : .45;
+    const tracking = t >= D.tAcq && t < D.tI;
+    beam.line.visible = tracking;
+    if (tracking) beam.set(toThree(D.radar), toThree(S.rv.position(t, P)));
+    const ir = t >= S.sat.tDetect && t < ST.tBo[2] + 6;
+    los.line.visible = ir;
+    if (ir) los.set(satPos, toThree(S.main.position(t, P)));
+  }
+
+  function binIdx(arr, t) { let lo = 0, hi = arr.length - 1; if (t <= arr[0]) return 0; if (t >= arr[hi]) return hi; while (hi - lo > 1) { const m = (lo + hi) >> 1; if (arr[m] <= t) lo = m; else hi = m; } return lo; }
+
+  // 光照：太阳可见性（地影）、大气红化、天空光
+  const sunI = toThree(S.sunDir).normalize();
+  function updateLighting(focusLocal, camLocal) {
+    const sunLocal = sunI.clone().applyQuaternion(earthQ.clone().invert());
+    U.uSun.value.copy(sunLocal);
+    U.uCam.value.copy(camLocal);
+    const sunWorld = sunI.clone().applyQuaternion(fgRoot.quaternion);
+    sunLight.position.copy(sunWorld); sunLight.target.position.set(0, 0, 0);
+    // 太阳精灵位于相机方向远处
+    sky.position.copy(camera.position); sky.quaternion.copy(fgRoot.quaternion);
+    sunSprite.position.copy(sunI).multiplyScalar(4e6);
+    // 焦点处地影
+    const p = focusLocal, d = p.dot(sunLocal), perp = p.clone().addScaledVector(sunLocal, -d).length();
+    const h = p.length() - RE;
+    const shadow = d < 0 ? THREE.MathUtils.smoothstep(perp, RE - 15, RE + 25) : 1;
+    const mu = p.clone().normalize().dot(sunLocal);
+    const tr = sunTint(h < 100 ? mu + Math.acos(Math.min(1, RE / (RE + Math.max(0, h)))) * .9 : 1);
+    sunLight.color.setRGB(tr[0], tr[1], tr[2]); sunLight.intensity = 3.2 * shadow;
+    const dayGround = THREE.MathUtils.smoothstep(mu, -.15, .2);
+    const skyAmt = THREE.MathUtils.smoothstep(-h, -60, 0) * dayGround;
+    hemi.color.setRGB(.35, .55, .95); hemi.groundColor.setRGB(.05, .14, .26);
+    hemi.intensity = .06 + .9 * skyAmt + .25 * dayGround * (1 - skyAmt);
+    fgScene.environmentIntensity = .15 + .6 * dayGround;
+    // 星空：白昼大气中隐去
+    const camH = camLocal.length() - RE, camMu = camLocal.clone().normalize().dot(sunLocal);
+    stars.material.uniforms.uVis.value = 1 - THREE.MathUtils.smoothstep(camMu, -.18, .05) * THREE.MathUtils.smoothstep(-camH, -70, -10);
+    earth.clouds.visible = state.layers.clouds;
+  }
+
+  // 标注与标记点
+  const projV = v3();
+  function updateLabels(t, camLocal) {
+    const rect = canvas.getBoundingClientRect();
+    const occluded = p => {
+      // 地球遮挡：相机→点 的线段与地球相交
+      const d = p.clone().sub(camLocal), L = d.length(); d.divideScalar(L);
+      const b = camLocal.dot(d), c = camLocal.lengthSq() - (RE - 1) * (RE - 1), disc = b * b - c;
+      if (disc < 0) return false; const s = -b - Math.sqrt(disc);
+      return s > 0 && s < L - 1;
+    };
+    const st = objState('stack', t), itc = objState('interceptor', t);
+    for (const l of labelDefs) {
+      let p = l.pos ? l.pos() : null, show = state.layers.labels && (!l.layer || state.layers[l.layer]) && (!l.after || t > l.after);
+      if (l.id === 'vehicle') { p = st.p; l.b.textContent = st.name; l.small.textContent = `${st.h.toFixed(0)} km · ${st.v.toFixed(2)} km/s`; show = show && t < D.tI + 30; }
+      if (l.id === 'itc') { p = itc.p; show = show && t >= D.tL && t < D.tI; l.small.textContent = `${itc.h.toFixed(1)} km · ${itc.v.toFixed(2)} km/s`; }
+      if (!p || !show) { l.el.style.display = 'none'; continue; }
+      const dist = p.distanceTo(camLocal);
+      if (dist < (l.id === 'vehicle' || l.id === 'itc' ? 3 : 8) || occluded(p)) { l.el.style.display = 'none'; continue; }
+      projV.copy(p).applyMatrix4(fgEarth.matrixWorld).project(camera);
+      if (projV.z > 1 || Math.abs(projV.x) > 1.1 || Math.abs(projV.y) > 1.1) { l.el.style.display = 'none'; continue; }
+      l.el.style.display = 'block';
+      l.el.style.transform = `translate(${(projV.x * .5 + .5) * rect.width + 9}px, ${(-projV.y * .5 + .5) * rect.height}px) translateY(-50%)`;
+      l.el.style.left = '0'; l.el.style.top = '0';
+    }
+    // 标记点
+    const list = [
+      [st.p, [1, .45, .3], 7, t < D.tI],
+      [itc.p, [.45, .95, 1], 6, t >= D.tL && t < D.tI],
+      [site, [1, .5, .4], 5, true],
+      [ship, [.45, .95, 1], 5, true],
+      [satPos, [.8, .65, 1], 6, true],
+      [impactP, [1, .78, .4], 5, true],
+      [PIthree, [1, .85, .5], 8, t >= D.tI && t < D.tI + 60],
+      [pbvObj.wrap.position, [.8, .8, .8], 4, pbvObj.wrap.visible],
+    ];
+    list.forEach(([p, c, s, vis], i) => {
+      const dist = p.distanceTo(camLocal);
+      markers.set(i, p, c, s, vis ? THREE.MathUtils.smoothstep(dist, 4, 40) : 0);
+    });
+    markers.points.geometry.attributes.position.needsUpdate = true;
+    markers.points.geometry.attributes.color.needsUpdate = true;
+    markers.points.geometry.attributes.size.needsUpdate = true;
+    // 跟踪准星（雷达跟踪期间）
+    const ret = $('#reticle');
+    if (t >= D.tAcq && t < D.tI && state.layers.sensors) {
+      projV.copy(objState('stack', t).p).applyMatrix4(fgEarth.matrixWorld).project(camera);
+      if (projV.z < 1) { ret.style.display = 'block'; ret.style.left = `${(projV.x * .5 + .5) * rect.width - 27}px`; ret.style.top = `${(-projV.y * .5 + .5) * rect.height - 27}px`; }
+      else ret.style.display = 'none';
+    } else ret.style.display = 'none';
+  }
+
+  // ---------------------------------------------------------------------------
+  // 主循环
+  // ---------------------------------------------------------------------------
+  let last = performance.now(), wall = 0;
+  function frame(now) {
+    requestAnimationFrame(frame);
+    const dt = Math.min(.05, (now - last) / 1000); last = now; wall += dt;
+    const target = state.speedMode === 'auto' ? autoSpeed(state.t) : state.speed;
+    state.speedNow = Math.exp(Math.log(state.speedNow) + (Math.log(target) - Math.log(state.speedNow)) * Math.min(1, dt * 3));
+    if (state.playing) {
+      state.t = Math.min(S.t1, state.t + dt * state.speedNow);
+      if (state.t >= S.t1) setPlaying(false);
+    }
+    const t = state.t;
+    updateWorld(t, wall);
+    const spec = updateRig(dt, t);
+    controls.update();
+    fgScene.updateMatrixWorld(); bgScene.updateMatrixWorld();
+    // 相机不进入海面以下
+    const camLocal = fgEarth.worldToLocal(camera.position.clone());
+    if (camLocal.length() < RE + .0025) {
+      camLocal.setLength(RE + .0025);
+      camera.position.copy(camLocal.clone().applyMatrix4(fgEarth.matrixWorld));
+      fgScene.updateMatrixWorld();
+    }
+    const focusLocal = fgEarth.worldToLocal(new THREE.Vector3());
+    updateLighting(focusLocal, camLocal);
+    Object.entries(layers).forEach(([k, g]) => { g.visible = state.layers[k]; });
+    updateLabels(t, camLocal);
+    const radar = D.radarSees(S.rv.position(Math.max(t, ST.tRelease)));
+    const hudO = spec.o ?? objState(state.cam === 'auto' ? 'stack' : 'stack', t);
+    ui.update(t, state.speedNow, { playing: state.playing, radar: t >= D.tAcq && t < D.tI ? radar : null, hud: hudO });
+    $('#timeline').value = ((t - S.t0) / (S.t1 - S.t0) * 10000).toFixed(0);
+    composer.render();
+  }
+
+  // ---------------------------------------------------------------------------
+  // 交互
+  // ---------------------------------------------------------------------------
+  function setPlaying(p) { state.playing = p; $('#playBtn').textContent = p ? 'Ⅱ' : '▶'; }
+  function seek(t) { state.t = THREE.MathUtils.clamp(t, S.t0, S.t1); ui.lastEv = S.events.findLastIndex?.(e => e.t <= state.t) ?? -1; }
+  let toastTimer;
+  function toast(e) {
+    const el = $('#toast'); el.innerHTML = `${e.label}${e.detail ? `<small>${e.detail}</small>` : ''}`; el.classList.add('show');
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('show'), 2600);
+  }
+  $('#playBtn').addEventListener('click', () => { if (state.t >= S.t1) state.t = S.t0; setPlaying(!state.playing); });
+  $('#resetBtn').addEventListener('click', () => { seek(S.t0); setPlaying(false); });
+  $('#stepBtn').addEventListener('click', () => { const n = S.events.find(e => e.t > state.t + 1); seek(n ? n.t - 1.5 : S.t1); });
+  $('#timeline').addEventListener('input', e => { seek(S.t0 + (+e.target.value / 10000) * (S.t1 - S.t0)); });
+  document.querySelectorAll('[data-speed]').forEach(b => b.addEventListener('click', () => {
+    state.speedMode = b.dataset.speed === 'auto' ? 'auto' : 'manual'; state.speed = +b.dataset.speed || 1;
+    document.querySelectorAll('[data-speed]').forEach(x => x.classList.toggle('active', x === b));
+  }));
+  document.querySelectorAll('[data-layer]').forEach(i => i.addEventListener('change', () => { state.layers[i.dataset.layer] = i.checked; }));
+  const camBtns = document.querySelectorAll('[data-cam]');
+  function setCam(mode) {
+    state.cam = mode; camBtns.forEach(b => b.classList.toggle('active', b.dataset.cam === mode));
+    if (mode === 'chase') { const o = state.chase === 'auto' ? director(state.t)[1] || 'stack' : state.chase; setView('chase', o, baseDist[o] ?? .05); }
+    if (mode === 'globe') setView('globe', null, 30000);
+    if (mode === 'region') setView('region', null, 3400);
+  }
+  camBtns.forEach(b => b.addEventListener('click', () => setCam(b.dataset.cam)));
+  $('#chaseTarget').addEventListener('change', e => { state.chase = e.target.value; if (state.chase === 'auto') setCam('auto'); else setCam('chase'); });
+  $('#drawerBtn').addEventListener('click', () => $('#knowledgeDrawer').classList.toggle('open'));
+  window.addEventListener('keydown', e => { if (e.code === 'Space' && e.target.tagName !== 'INPUT' && e.target.tagName !== 'SELECT') { e.preventDefault(); $('#playBtn').click(); } });
+
+  function resize() {
+    const r = canvas.parentElement.getBoundingClientRect();
+    renderer.setSize(r.width, r.height, false); composer.setSize(r.width, r.height);
+    camera.aspect = r.width / r.height; camera.updateProjectionMatrix();
+    const pr = renderer.getPixelRatio();
+    fgScene.traverse(o => { if (o.material?.isLineMaterial) o.material.resolution.set(r.width * pr, r.height * pr); });
+    sunSprite.material.uniforms.uRes.value.set(r.width * pr, r.height * pr);
+    markers.points.material.uniforms.uScale.value = pr;
+  }
+  window.addEventListener('resize', resize); resize();
+  setView('chase', 'stack', .085);
+  camera.position.set(-.062, .007, -.05);
+  controls.update();
+  $('#loading').classList.add('done');
+  requestAnimationFrame(frame);
+  window.__sim = { S, state, camera, seek, setPlaying };
 }
-function updateObjects(){const p=state.progress;vehicle.position.copy(flightPoint(Math.min(p,.96)));vehicle.visible=p>=.075&&p<.965;const scale=.7+Math.sin(performance.now()*.006)*.18;vehicleHalo.scale.setScalar(scale);const unc=.12+.22*Math.sin(Math.PI*Math.min(p/.84,1));uncertaintyGroup.position.copy(vehicle.position);uncertaintyRing.scale.setScalar(1+unc*2.2);uncertaintyRing.quaternion.copy(camera.quaternion);estimateDot.position.set(Math.sin(p*18)*unc*.16,Math.cos(p*13)*unc*.13,0);estimateDot.quaternion.copy(camera.quaternion);uncertaintyGroup.visible=state.layers.uncertainty&&vehicle.visible;trajectoryGroup.visible=state.layers.trajectory;defenseGroup.visible=state.layers.defense;
-  const it=THREE.MathUtils.clamp((p-.80)/.11,0,1);interceptor.visible=p>.80&&p<.93;interceptor.position.copy(interceptorPoint(it));const burst=Math.max(0,1-Math.abs(p-.91)/.025);eventBurst.material.opacity=burst*.65;eventBurst.scale.setScalar(.7+burst*2.5);
-  const reticle=document.querySelector('#reticle');if(p>.58&&p<.93&&state.layers.defense){const v=vehicle.position.clone().project(camera),rect=canvas.getBoundingClientRect();reticle.style.display='block';reticle.style.left=`${(v.x*.5+.5)*rect.width-23}px`;reticle.style.top=`${(-v.y*.5+.5)*rect.height-23}px`;}else reticle.style.display='none';
-}
-function resize(){const r=canvas.parentElement.getBoundingClientRect();renderer.setSize(r.width,r.height,false);camera.aspect=r.width/r.height;camera.updateProjectionMatrix();}
-function animate(now){requestAnimationFrame(animate);const dt=Math.min((now-state.last)/1000,.05);state.last=now;if(state.playing){state.progress+=dt*.028*state.speed;if(state.progress>=1){state.progress=1;state.playing=false;document.querySelector('#playBtn').textContent='▶';}}controls.update();updateObjects();updateUI();labelEls.forEach(([id,p])=>positionLabel(document.querySelector('#'+id),p));renderer.render(scene,camera);}
-window.addEventListener('resize',resize);resize();requestAnimationFrame(animate);
 
-document.querySelector('#playBtn').addEventListener('click',e=>{state.playing=!state.playing;if(state.progress>=1)state.progress=0;e.currentTarget.textContent=state.playing?'Ⅱ':'▶';});
-document.querySelector('#resetBtn').addEventListener('click',()=>{state.progress=0;state.playing=false;document.querySelector('#playBtn').textContent='▶';});
-document.querySelector('#stepBtn').addEventListener('click',()=>{const next=phases.find(x=>x.start>state.progress+.005);state.progress=next?next.start:1;state.playing=false;document.querySelector('#playBtn').textContent='▶';});
-document.querySelector('#timeline').addEventListener('input',e=>{state.progress=+e.target.value/1000;state.playing=false;document.querySelector('#playBtn').textContent='▶';});
-document.querySelectorAll('[data-speed]').forEach(btn=>btn.addEventListener('click',()=>{state.speed=+btn.dataset.speed;document.querySelectorAll('[data-speed]').forEach(b=>b.classList.toggle('active',b===btn));}));
-document.querySelectorAll('[data-layer]').forEach(input=>input.addEventListener('change',()=>state.layers[input.dataset.layer]=input.checked));
-document.querySelector('#drawerBtn').addEventListener('click',()=>document.querySelector('#knowledgeDrawer').classList.toggle('open'));
-document.querySelectorAll('.phase-item').forEach((el,i)=>el.addEventListener('click',()=>{state.progress=phases[i].start;state.playing=false;}));
+// -----------------------------------------------------------------------------
+// 辅助构造
+// -----------------------------------------------------------------------------
+function mulberry(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+function sunTint(mu) {
+  const m = 1 / Math.max(.035, mu + .15 * Math.pow(Math.max(1e-3, 93.885 - Math.acos(Math.min(1, Math.max(-1, mu))) * 180 / Math.PI), -1.253));
+  const tau = [5.802e-3 * 8 + 4.4e-3 * 1.2, 13.558e-3 * 8 + 4.4e-3 * 1.2, 33.1e-3 * 8 + 4.4e-3 * 1.2];
+  return tau.map(x => Math.exp(-x * m));
+}
+
+function envScene() {
+  const s = new THREE.Scene();
+  const m = new THREE.ShaderMaterial({
+    side: THREE.BackSide,
+    vertexShader: 'varying vec3 vP; void main(){ vP = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.); }',
+    fragmentShader: 'varying vec3 vP; void main(){ float y = normalize(vP).y; vec3 c = y > 0. ? mix(vec3(.55,.62,.7), vec3(.18,.32,.6), pow(y,.6)) : mix(vec3(.25,.3,.34), vec3(.03,.08,.13), pow(-y,.4)); gl_FragColor = vec4(c,1.); }',
+  });
+  s.add(new THREE.Mesh(new THREE.SphereGeometry(10, 32, 16), m));
+  return s;
+}
+
+function makeStars() {
+  const N = 9000, pos = [], col = [], mag = [];
+  const r = mulberry(42);
+  // 银河面：倾斜大圆附近星密度更高
+  const gp = new THREE.Vector3(.3, .85, -.42).normalize();
+  for (let i = 0; i < N; i++) {
+    let d = new THREE.Vector3(r() * 2 - 1, r() * 2 - 1, r() * 2 - 1).normalize();
+    if (i > N * .55) { d.addScaledVector(gp, -d.dot(gp) * (.85 + r() * .15)).normalize(); }
+    pos.push(d.x * 1e6, d.y * 1e6, d.z * 1e6);
+    const m = -1 + Math.pow(r(), .35) * 7.5;
+    mag.push(m);
+    const T = r();
+    const c = T < .15 ? [.7, .8, 1] : T < .5 ? [.95, .96, 1] : T < .8 ? [1, .95, .85] : [1, .82, .65];
+    col.push(...c);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  g.setAttribute('mag', new THREE.Float32BufferAttribute(mag, 1));
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uVis: { value: 1 } }, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    vertexShader: `${LOGDEPTH_VERT_PARS} attribute float mag; attribute vec3 color; varying vec3 vC; uniform float uVis;
+      void main(){ float b = pow(2.512, -mag) ; vC = color * min(1.6, b * 1.4) * uVis; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.); gl_PointSize = clamp(1.2 + b * 1.6, 1.2, 4.); ${LOGDEPTH_VERT} }`,
+    fragmentShader: `${LOGDEPTH_FRAG_PARS} varying vec3 vC; void main(){ ${LOGDEPTH_FRAG} float r = length(gl_PointCoord - .5) * 2.; gl_FragColor = vec4(vC * exp(-r * r * 3.), 1.); }`,
+  });
+  const p = new THREE.Points(g, mat); p.renderOrder = -20; p.frustumCulled = false;
+  return p;
+}
+
+function makeMarkers(n) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(n * 3), 3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(new Float32Array(n * 4), 4));
+  g.setAttribute('size', new THREE.Float32BufferAttribute(new Float32Array(n), 1));
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uScale: { value: 1 } }, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    vertexShader: `${LOGDEPTH_VERT_PARS} attribute vec4 color; attribute float size; uniform float uScale; varying vec4 vC;
+      void main(){ vC = color; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.); gl_PointSize = size * 3. * uScale; ${LOGDEPTH_VERT} }`,
+    fragmentShader: `${LOGDEPTH_FRAG_PARS} varying vec4 vC; void main(){ ${LOGDEPTH_FRAG} float r = length(gl_PointCoord - .5) * 2.; float a = exp(-r * r * 9.) * 2.5 + exp(-r * r * 2.) * .5; a *= 1. - smoothstep(.85, 1., r); gl_FragColor = vec4(vC.rgb * a * vC.a, 1.); }`,
+  });
+  const points = new THREE.Points(g, mat); points.frustumCulled = false; points.renderOrder = 10;
+  return {
+    points,
+    set(i, p, c, s, a) { g.attributes.position.setXYZ(i, p.x, p.y, p.z); g.attributes.color.setXYZW(i, c[0], c[1], c[2], a); g.attributes.size.setX(i, s); },
+  };
+}
+
+function makeSheath() {
+  // 再入体等离子鞘：沿外形略放大的发光壳，菲涅尔边缘与前缘更亮
+  const pts = [new THREE.Vector2(.31, -.02), new THREE.Vector2(.23, .85), new THREE.Vector2(.1, 1.72), new THREE.Vector2(.06, 1.8), new THREE.Vector2(.001, 1.83)];
+  const geo = new THREE.LatheGeometry(pts, 48);
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uI: { value: 0 }, uTime: { value: 0 } }, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.DoubleSide,
+    vertexShader: `${LOGDEPTH_VERT_PARS} varying vec3 vN; varying vec3 vV; varying float vY; void main(){ vY = position.y; vec4 mv = modelViewMatrix * vec4(position,1.); vN = normalize(normalMatrix * normal); vV = normalize(-mv.xyz); gl_Position = projectionMatrix * mv; ${LOGDEPTH_VERT} }`,
+    fragmentShader: `${LOGDEPTH_FRAG_PARS} uniform float uI, uTime; varying vec3 vN; varying vec3 vV; varying float vY;
+      void main(){ ${LOGDEPTH_FRAG} float f = 1. - abs(dot(normalize(vN), normalize(vV))); float nose = smoothstep(1.2, 1.83, vY);
+        float flick = .85 + .15 * sin(uTime * 60. + vY * 20.);
+        vec3 c = mix(vec3(1.4, .5, .18), vec3(2.6, 2.1, 1.7), nose);
+        gl_FragColor = vec4(c * (pow(f, 1.5) * .9 + nose * 1.4) * uI * flick, 1.); }`,
+  });
+  const m = new THREE.Mesh(geo, mat); m.frustumCulled = false;
+  return m;
+}
